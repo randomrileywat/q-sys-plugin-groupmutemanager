@@ -4,8 +4,18 @@
 -- rwatson@onediversified.com
 --
 -- Current Version:
--- v251114.1 (RWatson)
---  - Initial Release to Github.
+-- v260110.7 (RWatson)
+--  - Improvement: Reduced drift tolerance for clock sync to improve timing accuracy.
+--
+-- Change Log:
+-- v260110.6 (RWatson)
+--  - Improvement: Updated flash timing to use shared wall-clock time (os.time) for sub-second precision.
+--
+-- v260110.5 (RWatson)
+--  - BugFix: Fixed race condition causing zone mute states to update iradically when changed via pin input.
+--
+-- v260110.3 (RWatson)
+--  - BugFix: Zone Mute buttons now properly accept "3" and "4" as valid inputs (faulted mute states).
 --
 ---------------------------------------------------------------
 
@@ -14,7 +24,7 @@
 ---------------------------------------------------------------
 PluginInfo = {
   Name = "Group Mute Manager",
-  Version = "251114.1",
+  Version = "260110.7",
   Id = "a695808a-01a5-4b46-913d-608505abef46",
   Author = "Riley Watson",
   Description = "Manages up to 16 group mute buttons with up to 32 zone members each.",
@@ -79,8 +89,8 @@ function GetControls(props)
     table.insert(ctrls, { Name = "GroupAllMuteEnable_" .. g, ControlType = "Button", ButtonType = "Toggle", UserPin = true, PinStyle = "Both" })
 
     for m = 1, 32 do
-      table.insert(ctrls, { Name = "Zone_Mute_G" .. g .. "-M" .. m, ControlType = "Button", ButtonType = "Toggle", UserPin = true, PinStyle = "Both" })
-      table.insert(ctrls, { Name = "ZoneMute_" .. g .. "_" .. m, ControlType = "Text" })
+      table.insert(ctrls, { Name = "Zone_Mute_G" .. g .. "-M" .. m, ControlType = "Button", ButtonType = "Toggle" })
+      table.insert(ctrls, { Name = "ZoneMute_" .. g .. "_" .. m, ControlType = "Text", UserPin = true, PinStyle = "Both" })
       table.insert(ctrls, { Name = "ZoneAmpStatus_" .. g .. "_" .. m, ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Both" })
       table.insert(ctrls, { Name = "ZoneLabel_" .. g .. "_" .. m, ControlType = "Text", UserPin = true, PinStyle = "Both" })
     end
@@ -155,8 +165,8 @@ function GetControlLayout(props)
 
       for m = 1, mCount do
         local x = startX + groupButtonWidth + 10 + (m - 1) * zoneButtonSpacing
-        layout["Zone_Mute_G"..g.."-M"..m]   = { PrettyName="Zone Mute~G"..g.."-M"..m, Legend="Zone "..m, Style="Button", Position={x,y}, Size={zoneButtonWidth,zoneButtonHeight} }
-        layout["ZoneMute_"..g.."_"..m]      = { PrettyName="Zone Mute G"..g.."-M"..m, Style="Text", Position={0,0}, Size={0,0} }
+        layout["Zone_Mute_G"..g.."-M"..m]   = { Legend="Zone "..m, Style="Button", Position={x,y}, Size={zoneButtonWidth,zoneButtonHeight} }
+        layout["ZoneMute_"..g.."_"..m]      = { PrettyName="Zone Mute~G"..g.."-M"..m, Style="Text", Position={0,0}, Size={0,0} }
         layout["ZoneAmpStatus_"..g.."_"..m] = { PrettyName="Zone Status~G"..g.."-M"..m, Style="Text", Position={0,0}, Size={0,0} }
       end
     end
@@ -240,7 +250,14 @@ local syncedOnce     = false
 local phase_offset_s = 0.0
 local FLASH_DUTY     = 0.25
 
+-- Sync tracking for smooth sub-second timing
+local sync_time_base  = nil   -- Last os.time() value we synced to
+local sync_clock_base = nil   -- os.clock() at that sync point
+
 local faulted_groups = {}
+local updatingState  = false  -- Guard flag to prevent recursive event handling
+local pendingGroupUpdates = {}  -- Track groups needing deferred update
+local deferredUpdateTimer = Timer.New()
 
 ---------------------------------------------------------------
 -- Helpers
@@ -330,7 +347,7 @@ local function period_s()
 end
 
 local function recompute_phase_offset() 
-  phase_offset_s = - (os.clock() % 1.0) 
+  -- No longer needed - using os.time() directly as shared reference
 end
 
 local function recompute_group_fault(g)
@@ -515,12 +532,14 @@ local function UpdateGroupState(g)
 
   group.GroupState.String = FaultedFromBase(stateStr, groupFault)
 
+  updatingState = true  -- Set guard to prevent recursive event handling
   for m, member in ipairs(group.Members) do
     local base = StateFromBoolean(member.button.Boolean)
     local zoneFaultOnly = (ZoneAmpStatus[g][m] or 0) ~= 0
     member.state.String = FaultedFromBase(base, zoneFaultOnly)
     UpdateZoneAmpOverlay(g, m)
   end
+  updatingState = false  -- Clear guard
 end
 
 local function OnFlashEdge()
@@ -543,6 +562,17 @@ end
 ---------------------------------------------------------------
 local function BindRuntimeSettings()
   dbg("BindRuntimeSettings()")
+
+  -- Setup deferred update timer handler
+  deferredUpdateTimer.EventHandler = function()
+    deferredUpdateTimer:Stop()
+    for g, _ in pairs(pendingGroupUpdates) do
+      UpdateGroupState(g)
+      for m = 1, mCount do UpdateZoneAmpOverlay(g, m) end
+    end
+    pendingGroupUpdates = {}
+    UpdateAllMute()
+  end
 
   for g = 1, gCount do
     ZoneAmpStatus[g] = {}
@@ -581,16 +611,29 @@ local function BindRuntimeSettings()
 
       if zbtn then
         zbtn.EventHandler = function()
+          -- Parse input to handle values 3 and 4 (faulted mute states)
+          -- Button controls receive pin values via .Value (numeric), not .String
+          local rawVal = zbtn.Value
+          local str = tostring(math.floor(rawVal + 0.5))  -- Round and convert to string
+          local val = ParseMuteInput(str)
+          if val then
+            if val == "1" then zbtn.Boolean = true
+            elseif val == "0" then zbtn.Boolean = false end
+          end
           UpdateGroupState(g); UpdateAllMute(); UpdateZoneAmpOverlay(g, m)
         end
       end
 
       if zst then
         zst.EventHandler = function()
+          if updatingState then return end  -- Prevent recursive calls during state update
           local val = ParseMuteInput(zst.String); if not val then return end
           if val == "1" then zbtn.Boolean = true end
           if val == "0" then zbtn.Boolean = false end
-          UpdateGroupState(g); UpdateAllMute(); UpdateZoneAmpOverlay(g, m)
+          -- Defer UpdateGroupState to allow simultaneous pin changes to settle
+          pendingGroupUpdates[g] = true
+          deferredUpdateTimer:Stop()
+          deferredUpdateTimer:Start(0.01)  -- 10ms delay to batch simultaneous changes
         end
       end
 
@@ -718,24 +761,44 @@ end
 ---------------------------------------------------------------
 function update_flash_state_and_schedule()
   local T = period_s()
-  local tmono  = os.clock() + phase_offset_s
+  
+  -- Use os.time() as shared reference, os.clock() for sub-second smoothness
+  -- Re-sync at each second boundary to prevent drift
+  local current_time = os.time()
+  local current_clock = os.clock()
+  
+  if sync_time_base == nil or current_time ~= sync_time_base then
+    -- New second boundary - resync
+    sync_time_base = current_time
+    sync_clock_base = current_clock
+  end
+  
+  -- Compute smooth time: wall-clock seconds + sub-second interpolation
+  local tmono = sync_time_base + (current_clock - sync_clock_base)
   local within = tmono % T
   local phase  = within / T
-  local isOn   = (phase < FLASH_DUTY)
+  
+  -- Shift phase so sync point (phase=0) occurs in middle of OFF period
+  -- With FLASH_DUTY=0.25: ON from shifted phase 0.0-0.25, OFF from 0.25-1.0
+  -- This way any timing resets happen during the OFF state
+  local shifted_phase = (phase + 0.375) % 1.0
+  local isOn = (shifted_phase >= 0.0 and shifted_phase < FLASH_DUTY)
 
   if not syncedOnce then
     dbg(string.format("[FLASH] Synchronized (sync=true, T=%.0f ms, duty=%.0f%%)", T*1000, FLASH_DUTY*100))
     syncedOnce, lastFlashState = true, isOn
   end
   if lastFlashState ~= isOn then
-    dbg(string.format(isOn and "[FLASH] Flash ON  (phase=%.3f, T=%.0f ms)" or "[FLASH] Flash OFF (phase=%.3f, T=%.0f ms)", phase, T*1000))
+    dbg(string.format(isOn and "[FLASH] Flash ON  (phase=%.3f, T=%.0f ms)" or "[FLASH] Flash OFF (phase=%.3f, T=%.0f ms)", shifted_phase, T*1000))
     lastFlashState = isOn
   end
 
   FlashState = (not (Controls.SuppressStatusFlash and Controls.SuppressStatusFlash.Boolean)) and isOn or false
   OnFlashEdge()
 
-  local to_next = isOn and (FLASH_DUTY*T - within) or (T - within)
+  -- Calculate time to next transition based on shifted phase
+  local to_next = isOn and (FLASH_DUTY - shifted_phase) * T or ((1.0 - shifted_phase + FLASH_DUTY) % 1.0) * T
+  if to_next < 0.01 then to_next = T end  -- Safety: avoid too-short delays
   local delay   = math.max(0.01, math.min(0.10, to_next * 0.5))
   FlashTicker:Start(delay)
 end
