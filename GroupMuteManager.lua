@@ -4,10 +4,13 @@
 -- rwatson@onediversified.com
 --
 -- Current Version:
+-- v260112.1 (RWatson) 
+--  - BugFix: Corrected issue where zone mute states could become desynced when group mute state changed via pin input.
+--
+-- Change Log:
 -- v260110.7 (RWatson)
 --  - Improvement: Reduced drift tolerance for clock sync to improve timing accuracy.
 --
--- Change Log:
 -- v260110.6 (RWatson)
 --  - Improvement: Updated flash timing to use shared wall-clock time (os.time) for sub-second precision.
 --
@@ -24,7 +27,7 @@
 ---------------------------------------------------------------
 PluginInfo = {
   Name = "Group Mute Manager",
-  Version = "260110.7",
+  Version = "260112.1",
   Id = "a695808a-01a5-4b46-913d-608505abef46",
   Author = "Riley Watson",
   Description = "Manages up to 16 group mute buttons with up to 32 zone members each.",
@@ -535,8 +538,8 @@ local function UpdateGroupState(g)
   updatingState = true  -- Set guard to prevent recursive event handling
   for m, member in ipairs(group.Members) do
     local base = StateFromBoolean(member.button.Boolean)
-    local zoneFaultOnly = (ZoneAmpStatus[g][m] or 0) ~= 0
-    member.state.String = FaultedFromBase(base, zoneFaultOnly)
+    -- Zone mute outputs only 0 or 1 (no fault encoding on output)
+    member.state.String = base
     UpdateZoneAmpOverlay(g, m)
   end
   updatingState = false  -- Clear guard
@@ -611,15 +614,6 @@ local function BindRuntimeSettings()
 
       if zbtn then
         zbtn.EventHandler = function()
-          -- Parse input to handle values 3 and 4 (faulted mute states)
-          -- Button controls receive pin values via .Value (numeric), not .String
-          local rawVal = zbtn.Value
-          local str = tostring(math.floor(rawVal + 0.5))  -- Round and convert to string
-          local val = ParseMuteInput(str)
-          if val then
-            if val == "1" then zbtn.Boolean = true
-            elseif val == "0" then zbtn.Boolean = false end
-          end
           UpdateGroupState(g); UpdateAllMute(); UpdateZoneAmpOverlay(g, m)
         end
       end
