@@ -4,10 +4,13 @@
 -- rwatson@onediversified.com
 --
 -- Current Version:
+-- v260117.1 (RWatson) 
+--  - BugFix: Corrected issue where zone mute buttons would not always update mute state.
+--
+-- Change Log:
 -- v260112.1 (RWatson) 
 --  - BugFix: Corrected issue where zone mute states could become desynced when group mute state changed via pin input.
 --
--- Change Log:
 -- v260110.7 (RWatson)
 --  - Improvement: Reduced drift tolerance for clock sync to improve timing accuracy.
 --
@@ -27,7 +30,7 @@
 ---------------------------------------------------------------
 PluginInfo = {
   Name = "Group Mute Manager",
-  Version = "260112.1",
+  Version = "260117.1",
   Id = "a695808a-01a5-4b46-913d-608505abef46",
   Author = "Riley Watson",
   Description = "Manages up to 16 group mute buttons with up to 32 zone members each.",
@@ -622,8 +625,14 @@ local function BindRuntimeSettings()
         zst.EventHandler = function()
           if updatingState then return end  -- Prevent recursive calls during state update
           local val = ParseMuteInput(zst.String); if not val then return end
-          if val == "1" then zbtn.Boolean = true end
-          if val == "0" then zbtn.Boolean = false end
+          -- Only process mute (1) or unmute (0) commands, ignore mixed (2)
+          if val == "1" then 
+            zbtn.Boolean = true
+          elseif val == "0" then 
+            zbtn.Boolean = false
+          else
+            return  -- Ignore "2" (mixed) - zones can only be muted or unmuted
+          end
           -- Defer UpdateGroupState to allow simultaneous pin changes to settle
           pendingGroupUpdates[g] = true
           deferredUpdateTimer:Stop()
