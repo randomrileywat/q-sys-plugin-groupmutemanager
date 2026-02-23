@@ -4,10 +4,16 @@
 -- rwatson@onediversified.com
 --
 -- Current Version:
+-- v260223.1 (RWatson)
+--  - Improvement: Flash timer now only runs when faults are active, reducing idle CPU usage.
+--  - BugFix: Protected updatingState guard with pcall to prevent permanent lockout on error.
+--  - Improvement: GetControls() now scoped to configured group/member count instead of max (16x32).
+--  - BugFix: Fixed nil variable in groupState handler causing zone overlays not to update on pin input.
+--
+-- Change Log:
 -- v260117.1 (RWatson) 
 --  - BugFix: Corrected issue where zone mute buttons would not always update mute state.
 --
--- Change Log:
 -- v260112.1 (RWatson) 
 --  - BugFix: Corrected issue where zone mute states could become desynced when group mute state changed via pin input.
 --
@@ -30,7 +36,7 @@
 ---------------------------------------------------------------
 PluginInfo = {
   Name = "Group Mute Manager",
-  Version = "260117.1",
+  Version = "260223.1",
   Id = "a695808a-01a5-4b46-913d-608505abef46",
   Author = "Riley Watson",
   Description = "Manages up to 16 group mute buttons with up to 32 zone members each.",
@@ -88,13 +94,16 @@ function GetControls(props)
     table.insert(ctrls, { Name = "All_Mute", ControlType = "Text", UserPin = true, PinStyle = "Both" })
   end
 
-  for g = 1, 16 do
+  local gMax = props["Group Count"].Value
+  local mMax = props["Members Per Group"].Value
+
+  for g = 1, gMax do
     table.insert(ctrls, { Name = "GroupButton_" .. g, ControlType = "Button", ButtonType = "Toggle" })
     table.insert(ctrls, { Name = "Group_Mute_" .. g, ControlType = "Text", UserPin = true, PinStyle = "Both" })
     table.insert(ctrls, { Name = "GroupAmpStatus_" .. g, ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Both" })
     table.insert(ctrls, { Name = "GroupAllMuteEnable_" .. g, ControlType = "Button", ButtonType = "Toggle", UserPin = true, PinStyle = "Both" })
 
-    for m = 1, 32 do
+    for m = 1, mMax do
       table.insert(ctrls, { Name = "Zone_Mute_G" .. g .. "-M" .. m, ControlType = "Button", ButtonType = "Toggle" })
       table.insert(ctrls, { Name = "ZoneMute_" .. g .. "_" .. m, ControlType = "Text", UserPin = true, PinStyle = "Both" })
       table.insert(ctrls, { Name = "ZoneAmpStatus_" .. g .. "_" .. m, ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Both" })
@@ -249,12 +258,13 @@ local AllRespect = {}
 local colorControls = { Controls.ColorMuted, Controls.ColorUnmuted, Controls.ColorMixed, Controls.ColorAmpFault }
 local DefaultColors = { Muted = "Red", Unmuted = "#8000530f", Mixed = "Yellow", AmpFault = "Orange" }
 
-local FlashState     = false
-local FlashTicker    = Timer.New()
-local lastFlashState = nil
-local syncedOnce     = false
-local phase_offset_s = 0.0
-local FLASH_DUTY     = 0.25
+local FlashState        = false
+local FlashTicker       = Timer.New()
+local lastFlashState    = nil
+local syncedOnce        = false
+local phase_offset_s    = 0.0
+local FLASH_DUTY        = 0.25
+local flashTimerRunning = false
 
 -- Sync tracking for smooth sub-second timing
 local sync_time_base  = nil   -- Last os.time() value we synced to
@@ -354,6 +364,33 @@ end
 
 local function recompute_phase_offset() 
   -- No longer needed - using os.time() directly as shared reference
+end
+
+local function AnyFaultActive()
+  for g = 1, gCount do
+    if faulted_groups[g] then return true end
+  end
+  return false
+end
+
+local function StartFlashIfNeeded()
+  if AnyFaultActive() then
+    if not flashTimerRunning then
+      flashTimerRunning = true
+      syncedOnce = false
+      update_flash_state_and_schedule()
+    end
+  else
+    if flashTimerRunning then
+      FlashTicker:Stop()
+      flashTimerRunning = false
+      FlashState = false
+      syncedOnce = false
+      lastFlashState = nil
+      OnFlashEdge()
+      dbg("[FLASH] Timer stopped (no faults)")
+    end
+  end
 end
 
 local function recompute_group_fault(g)
@@ -539,13 +576,16 @@ local function UpdateGroupState(g)
   group.GroupState.String = FaultedFromBase(stateStr, groupFault)
 
   updatingState = true  -- Set guard to prevent recursive event handling
-  for m, member in ipairs(group.Members) do
-    local base = StateFromBoolean(member.button.Boolean)
-    -- Zone mute outputs only 0 or 1 (no fault encoding on output)
-    member.state.String = base
-    UpdateZoneAmpOverlay(g, m)
-  end
-  updatingState = false  -- Clear guard
+  local ok, err = pcall(function()
+    for m, member in ipairs(group.Members) do
+      local base = StateFromBoolean(member.button.Boolean)
+      -- Zone mute outputs only 0 or 1 (no fault encoding on output)
+      member.state.String = base
+      UpdateZoneAmpOverlay(g, m)
+    end
+  end)
+  updatingState = false  -- Always clear guard, even on error
+  if not ok then dbg("[ERROR] UpdateGroupState: " .. tostring(err)) end
 end
 
 local function OnFlashEdge()
@@ -604,6 +644,7 @@ local function BindRuntimeSettings()
         GroupAmpStatus[g] = ParseAmpStatus(ctrl.String)
         faulted_groups[g] = (GroupAmpStatus[g] ~= 0) or nil
         UpdateGroupAmpOverlay(g); UpdateAllMute(); UpdateFaultOutputs()
+        StartFlashIfNeeded()
       end
     end
 
@@ -645,6 +686,7 @@ local function BindRuntimeSettings()
           ZoneAmpStatus[g][m] = ParseAmpStatus(ctrl.String)
           if ZoneAmpStatus[g][m] ~= 0 then faulted_groups[g] = true else faulted_groups[g] = (GroupAmpStatus[g] ~= 0) and true or nil end
             UpdateAllMute(); UpdateFaultOutputs(); UpdateAllOverlays(g, m)
+            StartFlashIfNeeded()
         end
       end
     end
@@ -675,7 +717,9 @@ local function BindRuntimeSettings()
         groupButton.Boolean = (val ~= "0")
         for _, member in ipairs(members) do member.button.Boolean = (val == "1") end
         for m = 1, mCount do UpdateZoneAmpOverlay(g, m) end
-        UpdateGroupState(g); UpdateAllMute(); UpdateAllOverlays(g, m)
+        UpdateGroupState(g); UpdateAllMute()
+        UpdateGroupAmpOverlay(g)
+        for m = 1, mCount do UpdateZoneAmpOverlay(g, m) end
       end
     end
     UpdateGroupState(g)
@@ -756,7 +800,7 @@ local function BindRuntimeSettings()
 
   recompute_phase_offset()
   syncedOnce, lastFlashState = false, nil
-  update_flash_state_and_schedule()
+  StartFlashIfNeeded()
 end
 
 ---------------------------------------------------------------
@@ -799,10 +843,21 @@ function update_flash_state_and_schedule()
   FlashState = (not (Controls.SuppressStatusFlash and Controls.SuppressStatusFlash.Boolean)) and isOn or false
   OnFlashEdge()
 
+  -- If no faults remain, stop the timer and exit
+  if not AnyFaultActive() then
+    FlashTicker:Stop()
+    flashTimerRunning = false
+    FlashState = false
+    OnFlashEdge()
+    dbg("[FLASH] Timer stopped (no faults)")
+    return
+  end
+
   -- Calculate time to next transition based on shifted phase
   local to_next = isOn and (FLASH_DUTY - shifted_phase) * T or ((1.0 - shifted_phase + FLASH_DUTY) % 1.0) * T
   if to_next < 0.01 then to_next = T end  -- Safety: avoid too-short delays
   local delay   = math.max(0.01, math.min(0.10, to_next * 0.5))
+  flashTimerRunning = true
   FlashTicker:Start(delay)
 end
 
@@ -811,7 +866,7 @@ FlashTicker.EventHandler = function() update_flash_state_and_schedule() end
 if Controls.AmpFlashRate then
   Controls.AmpFlashRate.EventHandler = function()
     syncedOnce = false
-    update_flash_state_and_schedule()
+    StartFlashIfNeeded()
   end
 end
 
