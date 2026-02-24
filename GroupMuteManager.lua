@@ -4,6 +4,10 @@
 -- rwatson@onediversified.com
 --
 -- Current Version:
+-- v260224.1 (RWatson)
+--  - BugFix: Removed write-back to GroupAmpStatus input pin in UpdateFaultOutputs to prevent feedback loop.
+--
+-- Change Log:
 -- v260223.1 (RWatson)
 --  - Improvement: Flash timer now only runs when faults are active, reducing idle CPU usage.
 --  - BugFix: Protected updatingState guard with pcall to prevent permanent lockout on error.
@@ -36,7 +40,7 @@
 ---------------------------------------------------------------
 PluginInfo = {
   Name = "Group Mute Manager",
-  Version = "260223.1",
+  Version = "260224.1",
   Id = "a695808a-01a5-4b46-913d-608505abef46",
   Author = "Riley Watson",
   Description = "Manages up to 16 group mute buttons with up to 32 zone members each.",
@@ -412,13 +416,10 @@ local function UpdateFaultOutputs()
     local gf = recompute_group_fault(g)
     if gf == 1 then any = 1 end
 
-    local pin = Controls["GroupAmpStatus_" .. g]
-    if pin then
-      local desired = (gf == 1) and "FAULT" or "OK"
-      if (pin.String or "") ~= desired then
-        pin.String = desired
-      end
-    end
+    -- NOTE: Do NOT write back to GroupAmpStatus_ here.
+    -- That control is an input pin driven by ext. systems; writing to it
+    -- re-triggers its EventHandler and causes a feedback loop that
+    -- desynchronizes fault states across groups.
 
     local out = Controls["GroupFault_" .. g]
     if out then out.String = tostring(gf) end
