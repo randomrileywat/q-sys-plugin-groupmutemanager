@@ -4,14 +4,16 @@
 -- rwatson@onediversified.com
 --
 -- Current Version:
+-- v260227.1 (RWatson)
+--  - Revert: Restored GetControls() to always create max controls to fix missing UI controls.
+--
+-- Change Log:
 -- v260224.1 (RWatson)
 --  - BugFix: Removed write-back to GroupAmpStatus input pin in UpdateFaultOutputs to prevent feedback loop.
 --
--- Change Log:
 -- v260223.1 (RWatson)
 --  - Improvement: Flash timer now only runs when faults are active, reducing idle CPU usage.
 --  - BugFix: Protected updatingState guard with pcall to prevent permanent lockout on error.
---  - Improvement: GetControls() now scoped to configured group/member count instead of max (16x32).
 --  - BugFix: Fixed nil variable in groupState handler causing zone overlays not to update on pin input.
 --
 -- Change Log:
@@ -38,35 +40,35 @@
 ---------------------------------------------------------------
 -- Plugin Info
 ---------------------------------------------------------------
+local MAX_GROUPS  = 16   -- Maximum number of mute groups (change as needed)
+local MAX_MEMBERS = 32   -- Maximum number of zone members per group (change as needed)
+
 PluginInfo = {
   Name = "Group Mute Manager",
-  Version = "260224.1",
+  Version = "260227.1",
   Id = "a695808a-01a5-4b46-913d-608505abef46",
   Author = "Riley Watson",
-  Description = "Manages up to 16 group mute buttons with up to 32 zone members each.",
+  Description = "Manages up to " .. MAX_GROUPS .. " group mute buttons with up to " .. MAX_MEMBERS .. " zone members each.",
   ShowDebug = true
 }
 
 ---------------------------------------------------------------
 -- Pages (Dynamic)
 ---------------------------------------------------------------
+local GROUPS_PER_PAGE = 8  -- Number of groups shown per page
+
 local function getPageList(props)
   local pages = {}
   local gCount = (props["Group Count"] and props["Group Count"].Value) or 1
-  if gCount <= 8 then
-    if gCount == 1 then
-      table.insert(pages, "Group 1")
+  local pageStart = 1
+  while pageStart <= gCount do
+    local pageEnd = math.min(pageStart + GROUPS_PER_PAGE - 1, gCount)
+    if pageStart == pageEnd then
+      table.insert(pages, "Group " .. pageStart)
     else
-      table.insert(pages, "Groups 1-" .. gCount)
+      table.insert(pages, "Groups " .. pageStart .. "-" .. pageEnd)
     end
-  else
-    if gCount == 9 then
-      table.insert(pages, "Groups 1-8")
-      table.insert(pages, "Group 9")
-    else
-      table.insert(pages, "Groups 1-8")
-      table.insert(pages, "Groups 9-" .. gCount)
-    end
+    pageStart = pageEnd + 1
   end
   table.insert(pages, "Settings")
   return pages
@@ -85,8 +87,8 @@ end
 ---------------------------------------------------------------
 function GetProperties()
   return {
-    { Name = "Group Count",       Type = "integer", Min = 1, Max = 16, Value = 2 },
-    { Name = "Members Per Group", Type = "integer", Min = 1, Max = 32, Value = 4 }
+    { Name = "Group Count",       Type = "integer", Min = 1, Max = MAX_GROUPS,  Value = 2 },
+    { Name = "Members Per Group", Type = "integer", Min = 1, Max = MAX_MEMBERS, Value = 4 }
   }
 end
 
@@ -101,13 +103,13 @@ function GetControls(props)
   local gMax = props["Group Count"].Value
   local mMax = props["Members Per Group"].Value
 
-  for g = 1, gMax do
+  for g = 1, MAX_GROUPS do
     table.insert(ctrls, { Name = "GroupButton_" .. g, ControlType = "Button", ButtonType = "Toggle" })
     table.insert(ctrls, { Name = "Group_Mute_" .. g, ControlType = "Text", UserPin = true, PinStyle = "Both" })
     table.insert(ctrls, { Name = "GroupAmpStatus_" .. g, ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Both" })
     table.insert(ctrls, { Name = "GroupAllMuteEnable_" .. g, ControlType = "Button", ButtonType = "Toggle", UserPin = true, PinStyle = "Both" })
 
-    for m = 1, mMax do
+    for m = 1, MAX_MEMBERS do
       table.insert(ctrls, { Name = "Zone_Mute_G" .. g .. "-M" .. m, ControlType = "Button", ButtonType = "Toggle" })
       table.insert(ctrls, { Name = "ZoneMute_" .. g .. "_" .. m, ControlType = "Text", UserPin = true, PinStyle = "Both" })
       table.insert(ctrls, { Name = "ZoneAmpStatus_" .. g .. "_" .. m, ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Both" })
@@ -140,8 +142,8 @@ function GetControlLayout(props)
   local current_page = pages[page_index] or pages[#pages]
 
   local layout, graphics = {}, {}
-  local gCount = math.max(1, math.min(16, props["Group Count"].Value or 1))
-  local mCount = math.max(1, math.min(32, props["Members Per Group"].Value or 1))
+  local gCount = math.max(1, math.min(MAX_GROUPS, props["Group Count"].Value or 1))
+  local mCount = math.max(1, math.min(MAX_MEMBERS, props["Members Per Group"].Value or 1))
 
   local startX, startY = 0, 0
   local spacingY = 36
@@ -356,7 +358,6 @@ local function ParseAmpStatus(v)
   return 1
 end
 
-
 local function period_s()
   local rate = (Controls.AmpFlashRate and Controls.AmpFlashRate.Value) or 100
   if rate > 100 then rate = 100 end
@@ -364,10 +365,6 @@ local function period_s()
   local T_fast, T_slow = 0.5, 12.0
   local t = (100 - rate) / 99.0
   return T_fast + (T_slow - T_fast) * t
-end
-
-local function recompute_phase_offset() 
-  -- No longer needed - using os.time() directly as shared reference
 end
 
 local function AnyFaultActive()
@@ -415,12 +412,6 @@ local function UpdateFaultOutputs()
   for g = 1, gCount do
     local gf = recompute_group_fault(g)
     if gf == 1 then any = 1 end
-
-    -- NOTE: Do NOT write back to GroupAmpStatus_ here.
-    -- That control is an input pin driven by ext. systems; writing to it
-    -- re-triggers its EventHandler and causes a feedback loop that
-    -- desynchronizes fault states across groups.
-
     local out = Controls["GroupFault_" .. g]
     if out then out.String = tostring(gf) end
   end
@@ -799,7 +790,6 @@ local function BindRuntimeSettings()
   UpdateAllMuteOverlay()
   UpdateFaultOutputs()
 
-  recompute_phase_offset()
   syncedOnce, lastFlashState = false, nil
   StartFlashIfNeeded()
 end
@@ -887,7 +877,7 @@ end, 0.1)
 
 end -- if Controls
 
---[[Copyright 2025 Riley Watson
+--[[Copyright 2026 Riley Watson
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software
 and associated documentation files (the "Software"), to deal in the Software without restriction,
 including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
