@@ -4,10 +4,13 @@
 -- rwatson@onediversified.com
 --
 -- Current Version:
+-- v260228.1 (RWatson)
+--  - Improvement: Updated default Muted and Mixed colors to use 80 opacity hex format for consistency.
+--
+-- Change Log:
 -- v260227.1 (RWatson)
 --  - Revert: Restored GetControls() to always create max controls to fix missing UI controls.
 --
--- Change Log:
 -- v260224.1 (RWatson)
 --  - BugFix: Removed write-back to GroupAmpStatus input pin in UpdateFaultOutputs to prevent feedback loop.
 --
@@ -45,7 +48,7 @@ local MAX_MEMBERS = 32   -- Maximum number of zone members per group (change as 
 
 PluginInfo = {
   Name = "Group Mute Manager",
-  Version = "260227.1",
+  Version = "260228.1",
   Id = "a695808a-01a5-4b46-913d-608505abef46",
   Author = "Riley Watson",
   Description = "Manages up to " .. MAX_GROUPS .. " group mute buttons with up to " .. MAX_MEMBERS .. " zone members each.",
@@ -262,7 +265,7 @@ local PinLastAt = { Group = {}, All = 0 }
 local GroupAmpStatus, ZoneAmpStatus = {}, {}
 local AllRespect = {}
 local colorControls = { Controls.ColorMuted, Controls.ColorUnmuted, Controls.ColorMixed, Controls.ColorAmpFault }
-local DefaultColors = { Muted = "Red", Unmuted = "#8000530f", Mixed = "Yellow", AmpFault = "Orange" }
+local DefaultColors = { Muted = "#80FF0000", Unmuted = "#8000530f", Mixed = "#80FFFF00", AmpFault = "Orange" }
 
 local FlashState        = false
 local FlashTicker       = Timer.New()
