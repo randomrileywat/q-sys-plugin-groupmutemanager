@@ -4,10 +4,23 @@
 -- rwatson@onediversified.com
 --
 -- Current Version:
+-- v260301.1 (RWatson)
+--  - Feature: Added "Clock to Master" option with settings UI
+--    (checkbox, code name field, connection LED). When enabled,
+--    syncs fault flash to Master Controller's Flash_Clock broadcast
+--    via EventHandler for tight visual synchronization across all
+--    instances. Falls back to local os.time() clock automatically
+--    when master is unavailable; auto-reconnects every 5 s.
+--  - Improvement: All_Mute EventHandler now uses updatingAllMute
+--    guard flag instead of broken value-comparison dedup. Internal
+--    writes from UpdateAllMute() are ignored; external writes from
+--    Master Controller or pins always process correctly.
+--  - Default Master Code Name: "GroupMuteMasterController"
+--
+-- Change Log:
 -- v260228.1 (RWatson)
 --  - Improvement: Updated default Muted and Mixed colors to use 80 opacity hex format for consistency.
 --
--- Change Log:
 -- v260227.1 (RWatson)
 --  - Revert: Restored GetControls() to always create max controls to fix missing UI controls.
 --
@@ -19,7 +32,6 @@
 --  - BugFix: Protected updatingState guard with pcall to prevent permanent lockout on error.
 --  - BugFix: Fixed nil variable in groupState handler causing zone overlays not to update on pin input.
 --
--- Change Log:
 -- v260117.1 (RWatson) 
 --  - BugFix: Corrected issue where zone mute buttons would not always update mute state.
 --
@@ -48,7 +60,7 @@ local MAX_MEMBERS = 32   -- Maximum number of zone members per group (change as 
 
 PluginInfo = {
   Name = "Group Mute Manager",
-  Version = "260228.1",
+  Version = "260301.1",
   Id = "a695808a-01a5-4b46-913d-608505abef46",
   Author = "Riley Watson",
   Description = "Manages up to " .. MAX_GROUPS .. " group mute buttons with up to " .. MAX_MEMBERS .. " zone members each.",
@@ -133,6 +145,11 @@ function GetControls(props)
   table.insert(ctrls, { Name = "ColorMixed_Preview",     ControlType = "Indicator", IndicatorType = "Led" })
   table.insert(ctrls, { Name = "ColorAmpFault_Preview",  ControlType = "Indicator", IndicatorType = "Led" })
 
+  -- Clock to Master
+  table.insert(ctrls, { Name = "ClockToMaster",     ControlType = "Button", ButtonType = "Toggle", Value = true })
+  table.insert(ctrls, { Name = "MasterCodeName",    ControlType = "Text" })
+  table.insert(ctrls, { Name = "MasterClockStatus", ControlType = "Indicator", IndicatorType = "Led" })
+
   return ctrls
 end
 
@@ -204,11 +221,13 @@ function GetControlLayout(props)
       { text="Color - Mixed",        y=86 },
       { text="Color - Amp Fault",    y=106 },
       { text="Disable Status Flash", y=126 },
+      { text="Clock to Master",      y=150 },
+      { text="Master Code Name",     y=170 },
     }
     for _, item in ipairs(labels) do
       table.insert(graphics, { Type="Label", Position={8,item.y}, Size={140,16}, Text=item.text, HTextAlign="Right" })
     end
-    table.insert(graphics, { Type="Label", Position={8, 160}, Size={200,16}, Text="Plugin Version: "..(PluginInfo.Version or "Unknown"), HTextAlign="Left" })
+    table.insert(graphics, { Type="Label", Position={8, 200}, Size={200,16}, Text="Plugin Version: "..(PluginInfo.Version or "Unknown"), HTextAlign="Left" })
 
     layout["AmpFlashRate"]        = { Style="Knob", Position={160,10},   Size={36,36} }
     layout["ColorMuted"]          = { Style="Text", Position={160,46},   Size={130,16}, Padding=0 }
@@ -216,6 +235,9 @@ function GetControlLayout(props)
     layout["ColorMixed"]          = { Style="Text", Position={160,86},   Size={130,16}, Padding=0 }
     layout["ColorAmpFault"]       = { Style="Text", Position={160,106},  Size={130,16}, Padding=0 }
     layout["SuppressStatusFlash"] = { Style="Button", Legend="", Position={150,126}, Size={16,16} }
+    layout["ClockToMaster"]       = { Style="Button", Legend="", Position={160,150}, Size={16,16} }
+    layout["MasterCodeName"]      = { Style="Text", Position={160,170}, Size={130,16}, Padding=0 }
+    layout["MasterClockStatus"]   = { Style="LED", Position={296,168}, Size={20,20} }
     layout["ColorMuted_Preview"]    = { Style="LED", Position={290,44},  Size={20,20} }
     layout["ColorUnmuted_Preview"]  = { Style="LED", Position={290,64},  Size={20,20} }
     layout["ColorMixed_Preview"]    = { Style="LED", Position={290,84},  Size={20,20} }
@@ -280,9 +302,16 @@ local sync_time_base  = nil   -- Last os.time() value we synced to
 local sync_clock_base = nil   -- os.clock() at that sync point
 
 local faulted_groups = {}
-local updatingState  = false  -- Guard flag to prevent recursive event handling
+local updatingState    = false  -- Guard flag to prevent recursive event handling
+local updatingAllMute  = false  -- Guard flag to prevent All_Mute EventHandler from re-entering during internal writes
 local pendingGroupUpdates = {}  -- Track groups needing deferred update
 local deferredUpdateTimer = Timer.New()
+
+-- Master clock sync
+local masterComp          = nil
+local masterConnected     = false
+local masterReconnTimer   = Timer.New()
+local MASTER_RECONNECT_S  = 5.0   -- Seconds between reconnect attempts
 
 ---------------------------------------------------------------
 -- Helpers
@@ -377,23 +406,51 @@ local function AnyFaultActive()
   return false
 end
 
+local function UsingMasterClock()
+  return Controls.ClockToMaster and Controls.ClockToMaster.Boolean
+         and masterConnected and masterComp
+end
+
+local function ReadMasterFlashNow()
+  -- Immediately read master's current state and apply it
+  if not masterComp then return end
+  pcall(function()
+    local isOn = (masterComp["Flash.Clock"].String == "1")
+    FlashState = (not flash_suppressed()) and isOn or false
+    OnFlashEdge()
+  end)
+end
+
 local function StartFlashIfNeeded()
   if AnyFaultActive() then
-    if not flashTimerRunning then
-      flashTimerRunning = true
-      syncedOnce = false
-      update_flash_state_and_schedule()
+    if UsingMasterClock() then
+      -- Master's EventHandler drives flash; stop local timer
+      if flashTimerRunning then
+        FlashTicker:Stop()
+        flashTimerRunning = false
+        dbg("[FLASH] Local timer stopped (master drives)")
+      end
+      -- Apply master's current state immediately so we're in sync
+      ReadMasterFlashNow()
+    else
+      -- Local clock mode
+      if not flashTimerRunning then
+        flashTimerRunning = true
+        syncedOnce = false
+        update_flash_state_and_schedule()
+      end
     end
   else
+    -- No faults: stop everything, clear flash
     if flashTimerRunning then
       FlashTicker:Stop()
       flashTimerRunning = false
-      FlashState = false
-      syncedOnce = false
-      lastFlashState = nil
-      OnFlashEdge()
       dbg("[FLASH] Timer stopped (no faults)")
     end
+    FlashState = false
+    syncedOnce = false
+    lastFlashState = nil
+    OnFlashEdge()
   end
 end
 
@@ -454,7 +511,9 @@ local function UpdateAllMute()
   end
 
   if Controls.AllMuteButton then Controls.AllMuteButton.Color = color end
+  updatingAllMute = true
   Controls.All_Mute.String = FaultedFromBase(base, anyFault == 1)
+  updatingAllMute = false
 end
 
 local function UpdateAllMuteOverlay()
@@ -599,6 +658,98 @@ local function UpdateAllOverlays(g, m)
 end
 
 ---------------------------------------------------------------
+-- Master Clock Connection
+---------------------------------------------------------------
+local function UpdateMasterClockIndicator()
+  if not Controls.MasterClockStatus then return end
+  if masterConnected then
+    Controls.MasterClockStatus.Boolean = true
+    Controls.MasterClockStatus.Color   = "#00FF00"
+  else
+    Controls.MasterClockStatus.Boolean = false
+    Controls.MasterClockStatus.Color   = "#80808080"
+  end
+end
+
+local function DisconnectFromMaster()
+  masterComp = nil
+  masterConnected = false
+  UpdateMasterClockIndicator()
+  dbg("[MASTER CLOCK] Disconnected")
+  -- Fall back to local flash timer if faults are active
+  syncedOnce = false
+  StartFlashIfNeeded()
+end
+
+local function ConnectToMaster()
+  local codeName = (Controls.MasterCodeName and Controls.MasterCodeName.String or ""):gsub("^%s*(.-)%s*$", "%1")
+  if codeName == "" then DisconnectFromMaster(); return end
+
+  if type(Component) ~= "table" or type(Component.New) ~= "function" then
+    dbg("[MASTER CLOCK] Component API not available")
+    DisconnectFromMaster()
+    return
+  end
+
+  local ok, comp = pcall(Component.New, codeName)
+  if not ok or not comp then
+    dbg("[MASTER CLOCK] '" .. codeName .. "' not found: " .. tostring(comp))
+    DisconnectFromMaster()
+    return
+  end
+
+  local flashCtrl = nil
+  pcall(function()
+    local ctrl = comp["Flash.Clock"]
+    if ctrl then local _ = ctrl.String; flashCtrl = ctrl end
+  end)
+
+  if not flashCtrl then
+    dbg("[MASTER CLOCK] Flash.Clock not accessible on '" .. codeName .. "'")
+    DisconnectFromMaster()
+    return
+  end
+
+  masterComp = comp
+  masterConnected = true
+  UpdateMasterClockIndicator()
+  dbg("[MASTER CLOCK] Connected to '" .. codeName .. "'")
+
+  -- EventHandler is the SOLE driver of flash in master mode.
+  -- Always track master state so FlashState is pre-synced when faults appear.
+  pcall(function()
+    flashCtrl.EventHandler = function()
+      if not (Controls.ClockToMaster and Controls.ClockToMaster.Boolean) then return end
+      if not masterConnected then return end
+      local isOn = (flashCtrl.String == "1")
+      FlashState = (not flash_suppressed()) and isOn or false
+      if AnyFaultActive() then OnFlashEdge() end
+    end
+  end)
+
+  -- Master takes over: stop local FlashTicker
+  if flashTimerRunning then
+    FlashTicker:Stop()
+    flashTimerRunning = false
+    dbg("[FLASH] Local timer stopped (master connected)")
+  end
+
+  -- Immediately read current master state
+  ReadMasterFlashNow()
+end
+
+local function StartMasterReconnect()
+  masterReconnTimer:Stop()
+  if Controls.ClockToMaster and Controls.ClockToMaster.Boolean and not masterConnected then
+    masterReconnTimer:Start(MASTER_RECONNECT_S)
+  end
+end
+
+local function StopMasterReconnect()
+  masterReconnTimer:Stop()
+end
+
+---------------------------------------------------------------
 -- Wiring + Initialization
 ---------------------------------------------------------------
 local function BindRuntimeSettings()
@@ -737,9 +888,8 @@ local function BindRuntimeSettings()
     end
 
     Controls.All_Mute.EventHandler = function()
-      local n = now_ms(); if not debounce_ok(PinLastAt.All) then return end
-      local val = ParseMuteInput(Controls.All_Mute.String); if not val or PinState.All == val then return end
-      PinLastAt.All = n; PinState.All = val
+      if updatingAllMute then return end  -- Ignore internal write-backs from UpdateAllMute()
+      local val = ParseMuteInput(Controls.All_Mute.String); if not val then return end
       if val == "2" then
         Controls.AllMuteButton.Boolean = true
         Controls.AllMuteButton.Color   = Controls.ColorMixed.String
@@ -793,6 +943,52 @@ local function BindRuntimeSettings()
   UpdateAllMuteOverlay()
   UpdateFaultOutputs()
 
+  -- Master clock sync
+  if Controls.ClockToMaster then
+    Controls.ClockToMaster.EventHandler = function()
+      if Controls.ClockToMaster.Boolean then
+        ConnectToMaster()
+        if masterConnected then StopMasterReconnect() else StartMasterReconnect() end
+      else
+        StopMasterReconnect()
+        DisconnectFromMaster()
+      end
+      syncedOnce = false
+      StartFlashIfNeeded()
+    end
+  end
+
+  if Controls.MasterCodeName then
+    if not (Controls.MasterCodeName.String or ""):match("%S") then
+      Controls.MasterCodeName.String = "GroupMuteMasterController"
+    end
+    Controls.MasterCodeName.EventHandler = function()
+      if Controls.ClockToMaster and Controls.ClockToMaster.Boolean then
+        ConnectToMaster()
+        if masterConnected then StopMasterReconnect() else StartMasterReconnect() end
+        syncedOnce = false
+        StartFlashIfNeeded()
+      end
+    end
+  end
+
+  masterReconnTimer.EventHandler = function()
+    masterReconnTimer:Stop()
+    if Controls.ClockToMaster and Controls.ClockToMaster.Boolean and not masterConnected then
+      ConnectToMaster()
+      if masterConnected then StopMasterReconnect() else StartMasterReconnect() end
+      syncedOnce = false
+      StartFlashIfNeeded()
+    end
+  end
+
+  -- Initial master connection
+  if Controls.ClockToMaster and Controls.ClockToMaster.Boolean then
+    ConnectToMaster()
+    if not masterConnected then StartMasterReconnect() end
+  end
+  UpdateMasterClockIndicator()
+
   syncedOnce, lastFlashState = false, nil
   StartFlashIfNeeded()
 end
@@ -801,6 +997,9 @@ end
 -- Flash subsystem
 ---------------------------------------------------------------
 function update_flash_state_and_schedule()
+  -- This function is the LOCAL clock only.
+  -- When clocked to master, the master's EventHandler drives flash;
+  -- this function should not be called in that mode.
   local T = period_s()
   
   -- Use os.time() as shared reference, os.clock() for sub-second smoothness
