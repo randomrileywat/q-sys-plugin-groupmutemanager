@@ -852,10 +852,14 @@ local function BindRuntimeSettings()
       groupState.EventHandler = function()
         local n = now_ms(); if not debounce_ok(PinLastAt.Group[g]) then return end
         local val = ParseMuteInput(groupState.String); if not val then return end
-        if PinState.Group[g] == val and ((val == "0" and not groupButton.Boolean) or (val == "1" and groupButton.Boolean)) then return end
+        if PinState.Group[g] == val and ((val == "0" and not groupButton.Boolean) or (val == "1" and groupButton.Boolean)) then
+          -- Same value re-pushed (e.g. preset recall): still refresh color in case snapshot cleared it
+          UpdateGroupAmpOverlay(g)
+          return
+        end
         PinLastAt.Group[g] = n; PinState.Group[g] = val
         if val == "2" then
-          groupButton.Color = Controls.ColorMixed.String
+          groupButton.Color = GetColorOrDefault("ColorMixed","Mixed")
           groupState.String = "2"
           UpdateAllMute()
           return
@@ -892,7 +896,7 @@ local function BindRuntimeSettings()
       local val = ParseMuteInput(Controls.All_Mute.String); if not val then return end
       if val == "2" then
         Controls.AllMuteButton.Boolean = true
-        Controls.AllMuteButton.Color   = Controls.ColorMixed.String
+        Controls.AllMuteButton.Color   = GetColorOrDefault("ColorMixed","Mixed")
         Controls.All_Mute.String = "2"
         return
       end
