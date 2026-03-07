@@ -1085,6 +1085,52 @@ end
 Timer.CallAfter(function()
   BindRuntimeSettings()
   UpdateAllColorPreviews()
+
+  -- Deferred full refresh: amp status pins may arrive after init;
+  -- re-read all fault states and repaint every button to clear
+  -- stale orange overlays that were set before pin data was ready.
+  Timer.CallAfter(function()
+    dbg("[STARTUP] Deferred color refresh")
+    for g = 1, gCount do
+      local gctrl = Controls["GroupAmpStatus_" .. g]
+      GroupAmpStatus[g] = ParseAmpStatus(gctrl and gctrl.String)
+      for m = 1, mCount do
+        local zctrl = Controls["ZoneAmpStatus_" .. g .. "_" .. m]
+        ZoneAmpStatus[g][m] = ParseAmpStatus(zctrl and zctrl.String)
+      end
+      recompute_group_fault(g)
+      UpdateGroupState(g)
+      UpdateGroupAmpOverlay(g)
+      for m = 1, mCount do UpdateZoneAmpOverlay(g, m) end
+    end
+    UpdateFaultOutputs()
+    UpdateAllMute()
+    UpdateAllMuteOverlay()
+    UpdateAllColorPreviews()
+    StartFlashIfNeeded()
+  end, 3.0)
+
+  -- Second forced refresh at 30 s to catch late-arriving amp status updates
+  Timer.CallAfter(function()
+    dbg("[STARTUP] 30s forced color refresh")
+    for g = 1, gCount do
+      local gctrl = Controls["GroupAmpStatus_" .. g]
+      GroupAmpStatus[g] = ParseAmpStatus(gctrl and gctrl.String)
+      for m = 1, mCount do
+        local zctrl = Controls["ZoneAmpStatus_" .. g .. "_" .. m]
+        ZoneAmpStatus[g][m] = ParseAmpStatus(zctrl and zctrl.String)
+      end
+      recompute_group_fault(g)
+      UpdateGroupState(g)
+      UpdateGroupAmpOverlay(g)
+      for m = 1, mCount do UpdateZoneAmpOverlay(g, m) end
+    end
+    UpdateFaultOutputs()
+    UpdateAllMute()
+    UpdateAllMuteOverlay()
+    UpdateAllColorPreviews()
+    StartFlashIfNeeded()
+  end, 30.0)
 end, 0.1)
 
 end -- if Controls
