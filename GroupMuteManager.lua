@@ -4,6 +4,11 @@
 -- rwatson@onediversified.com
 --
 -- Current Version:
+-- v260306.1 (RWatson)
+--  - BugFix: Added forward declaration for OnFlashEdge to fix nil
+--    value error when called before its definition in Lua.
+--
+-- Change Log:
 -- v260301.1 (RWatson)
 --  - Feature: Added "Clock to Master" option with settings UI
 --    (checkbox, code name field, connection LED). When enabled,
@@ -17,7 +22,6 @@
 --    Master Controller or pins always process correctly.
 --  - Default Master Code Name: "GroupMuteMasterController"
 --
--- Change Log:
 -- v260228.1 (RWatson)
 --  - Improvement: Updated default Muted and Mixed colors to use 80 opacity hex format for consistency.
 --
@@ -60,7 +64,7 @@ local MAX_MEMBERS = 32   -- Maximum number of zone members per group (change as 
 
 PluginInfo = {
   Name = "Group Mute Manager",
-  Version = "260301.1",
+  Version = "260306.1",
   Id = "a695808a-01a5-4b46-913d-608505abef46",
   Author = "Riley Watson",
   Description = "Manages up to " .. MAX_GROUPS .. " group mute buttons with up to " .. MAX_MEMBERS .. " zone members each.",
@@ -287,7 +291,7 @@ local PinLastAt = { Group = {}, All = 0 }
 local GroupAmpStatus, ZoneAmpStatus = {}, {}
 local AllRespect = {}
 local colorControls = { Controls.ColorMuted, Controls.ColorUnmuted, Controls.ColorMixed, Controls.ColorAmpFault }
-local DefaultColors = { Muted = "#80FF0000", Unmuted = "#8000530f", Mixed = "#80FFFF00", AmpFault = "Orange" }
+local DefaultColors = { Muted = "#80FF0000", Unmuted = "#BF00530f", Mixed = "#BFFFFF00", AmpFault = "Orange" }
 
 local FlashState        = false
 local FlashTicker       = Timer.New()
@@ -405,6 +409,8 @@ local function AnyFaultActive()
   end
   return false
 end
+
+local OnFlashEdge  -- forward declaration (defined after overlay helpers)
 
 local function UsingMasterClock()
   return Controls.ClockToMaster and Controls.ClockToMaster.Boolean
@@ -642,7 +648,7 @@ local function UpdateGroupState(g)
   if not ok then dbg("[ERROR] UpdateGroupState: " .. tostring(err)) end
 end
 
-local function OnFlashEdge()
+OnFlashEdge = function()
   for g = 1, gCount do
     if faulted_groups[g] then
       UpdateGroupAmpOverlay(g)

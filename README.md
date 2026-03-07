@@ -64,6 +64,7 @@ Manages up to **16 groups** with up to **32 zone members** each. Provides per-zo
 
 | Version | Date | Notes |
 |---|---|---|
+| 260306.1 | 2026-03-06 | Fixed nil value error for `OnFlashEdge` by adding forward declaration |
 | 260301.1 | 2026-03-01 | Added "Clock to Master" flash sync (EventHandler-driven, auto-reconnect, local fallback); `updatingAllMute` guard flag fix for All_Mute EventHandler |
 | 260228.1 | 2026-02-28 | Updated default Muted and Mixed colors to 80 opacity hex format |
 | 260227.1 | 2026-02-27 | Restored GetControls() to always create max controls |
