@@ -4,11 +4,17 @@
 -- rwatson@onediversified.com
 --
 -- Current Version:
+-- v260313.1 (RWatson)
+--  - BugFix: Added updatingFromBulk guard to prevent cascading
+--    EventHandler calls during programmatic bulk writes. Fixes
+--    stale zone mute states being sent to amplifiers when group
+--    or all-mute operations set multiple buttons sequentially.
+--
+-- Change Log:
 -- v260306.1 (RWatson)
 --  - BugFix: Added forward declaration for OnFlashEdge to fix nil
 --    value error when called before its definition in Lua.
 --
--- Change Log:
 -- v260301.1 (RWatson)
 --  - Feature: Added "Clock to Master" option with settings UI
 --    (checkbox, code name field, connection LED). When enabled,
@@ -64,7 +70,7 @@ local MAX_MEMBERS = 32   -- Maximum number of zone members per group (change as 
 
 PluginInfo = {
   Name = "Group Mute Manager",
-  Version = "260306.1",
+  Version = "260313.1",
   Id = "a695808a-01a5-4b46-913d-608505abef46",
   Author = "Riley Watson",
   Description = "Manages up to " .. MAX_GROUPS .. " group mute buttons with up to " .. MAX_MEMBERS .. " zone members each.",
@@ -291,7 +297,7 @@ local PinLastAt = { Group = {}, All = 0 }
 local GroupAmpStatus, ZoneAmpStatus = {}, {}
 local AllRespect = {}
 local colorControls = { Controls.ColorMuted, Controls.ColorUnmuted, Controls.ColorMixed, Controls.ColorAmpFault }
-local DefaultColors = { Muted = "#80FF0000", Unmuted = "#BF00530f", Mixed = "#BFFFFF00", AmpFault = "Orange" }
+local DefaultColors = { Muted = "#BFFF0000", Unmuted = "#BF00530f", Mixed = "#BFFFFF00", AmpFault = "Orange" }
 
 local FlashState        = false
 local FlashTicker       = Timer.New()
@@ -308,8 +314,7 @@ local sync_clock_base = nil   -- os.clock() at that sync point
 local faulted_groups = {}
 local updatingState    = false  -- Guard flag to prevent recursive event handling
 local updatingAllMute  = false  -- Guard flag to prevent All_Mute EventHandler from re-entering during internal writes
-local pendingGroupUpdates = {}  -- Track groups needing deferred update
-local deferredUpdateTimer = Timer.New()
+local updatingFromBulk = false  -- Guard flag to prevent zbtn.EventHandler during programmatic bulk writes
 
 -- Master clock sync
 local masterComp          = nil
@@ -517,9 +522,12 @@ local function UpdateAllMute()
   end
 
   if Controls.AllMuteButton then Controls.AllMuteButton.Color = color end
-  updatingAllMute = true
-  Controls.All_Mute.String = FaultedFromBase(base, anyFault == 1)
-  updatingAllMute = false
+  local newAllMute = FaultedFromBase(base, anyFault == 1)
+  if Controls.All_Mute.String ~= newAllMute then
+    updatingAllMute = true
+    Controls.All_Mute.String = newAllMute
+    updatingAllMute = false
+  end
 end
 
 local function UpdateAllMuteOverlay()
@@ -633,14 +641,19 @@ local function UpdateGroupState(g)
     end 
   end
 
-  group.GroupState.String = FaultedFromBase(stateStr, groupFault)
+  local newGroupState = FaultedFromBase(stateStr, groupFault)
+  if group.GroupState.String ~= newGroupState then
+    group.GroupState.String = newGroupState
+  end
 
   updatingState = true  -- Set guard to prevent recursive event handling
   local ok, err = pcall(function()
     for m, member in ipairs(group.Members) do
       local base = StateFromBoolean(member.button.Boolean)
-      -- Zone mute outputs only 0 or 1 (no fault encoding on output)
-      member.state.String = base
+      -- Only write zone pin if the value actually changed
+      if member.state.String ~= base then
+        member.state.String = base
+      end
       UpdateZoneAmpOverlay(g, m)
     end
   end)
@@ -761,17 +774,6 @@ end
 local function BindRuntimeSettings()
   dbg("BindRuntimeSettings()")
 
-  -- Setup deferred update timer handler
-  deferredUpdateTimer.EventHandler = function()
-    deferredUpdateTimer:Stop()
-    for g, _ in pairs(pendingGroupUpdates) do
-      UpdateGroupState(g)
-      for m = 1, mCount do UpdateZoneAmpOverlay(g, m) end
-    end
-    pendingGroupUpdates = {}
-    UpdateAllMute()
-  end
-
   for g = 1, gCount do
     ZoneAmpStatus[g] = {}
     GroupAmpStatus[g] = 0
@@ -810,6 +812,7 @@ local function BindRuntimeSettings()
 
       if zbtn then
         zbtn.EventHandler = function()
+          if updatingFromBulk then return end  -- Suppress during programmatic bulk writes
           UpdateGroupState(g); UpdateAllMute(); UpdateZoneAmpOverlay(g, m)
         end
       end
@@ -819,17 +822,11 @@ local function BindRuntimeSettings()
           if updatingState then return end  -- Prevent recursive calls during state update
           local val = ParseMuteInput(zst.String); if not val then return end
           -- Only process mute (1) or unmute (0) commands, ignore mixed (2)
-          if val == "1" then 
-            zbtn.Boolean = true
-          elseif val == "0" then 
-            zbtn.Boolean = false
-          else
-            return  -- Ignore "2" (mixed) - zones can only be muted or unmuted
-          end
-          -- Defer UpdateGroupState to allow simultaneous pin changes to settle
-          pendingGroupUpdates[g] = true
-          deferredUpdateTimer:Stop()
-          deferredUpdateTimer:Start(0.01)  -- 10ms delay to batch simultaneous changes
+          if val ~= "1" and val ~= "0" then return end
+          updatingFromBulk = true
+          zbtn.Boolean = (val == "1")
+          updatingFromBulk = false
+          UpdateGroupState(g); UpdateAllMute(); UpdateZoneAmpOverlay(g, m)
         end
       end
 
@@ -848,7 +845,9 @@ local function BindRuntimeSettings()
     if groupButton then
       groupButton.EventHandler = function()
         local state = groupButton.Boolean
+        updatingFromBulk = true
         for _, member in ipairs(members) do member.button.Boolean = state end
+        updatingFromBulk = false
         for m = 1, mCount do UpdateZoneAmpOverlay(g, m) end
         UpdateGroupState(g); UpdateAllMute()
       end
@@ -870,8 +869,10 @@ local function BindRuntimeSettings()
           UpdateAllMute()
           return
         end
+        updatingFromBulk = true
         groupButton.Boolean = (val ~= "0")
         for _, member in ipairs(members) do member.button.Boolean = (val == "1") end
+        updatingFromBulk = false
         for m = 1, mCount do UpdateZoneAmpOverlay(g, m) end
         UpdateGroupState(g); UpdateAllMute()
         UpdateGroupAmpOverlay(g)
@@ -887,9 +888,15 @@ local function BindRuntimeSettings()
 
     Controls.AllMuteButton.EventHandler = function()
       local state = Controls.AllMuteButton.Boolean
+      updatingFromBulk = true
       for g = 1, gCount do
         if AllRespect[g] then
           for _, member in ipairs(Groups[g].Members) do member.button.Boolean = state end
+        end
+      end
+      updatingFromBulk = false
+      for g = 1, gCount do
+        if AllRespect[g] then
           for m = 1, mCount do UpdateZoneAmpOverlay(g, m) end
           UpdateGroupState(g)
         end
@@ -907,10 +914,16 @@ local function BindRuntimeSettings()
         return
       end
       local target = (val == "1")
+      updatingFromBulk = true
       Controls.AllMuteButton.Boolean = target
       for g = 1, gCount do
         if AllRespect[g] then
           for _, member in ipairs(Groups[g].Members) do member.button.Boolean = target end
+        end
+      end
+      updatingFromBulk = false
+      for g = 1, gCount do
+        if AllRespect[g] then
           for m = 1, mCount do UpdateZoneAmpOverlay(g, m) end
           UpdateGroupState(g)
         end
